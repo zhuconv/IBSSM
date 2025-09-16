@@ -14,20 +14,40 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import builtins
 import logging
 import os
+import math
+import glob
+import random
 from itertools import chain
 from dataclasses import dataclass, field
 from typing import Optional
 
+import wandb
 import torch
 import torch.distributed
 import transformers
-from config_llama import MyLlamaConfig
-from transformers import Trainer, default_data_collator, AutoTokenizer
-from datasets import load_dataset, IterableDataset
+from transformers import Trainer, default_data_collator, AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from datasets import load_dataset, load_from_disk, IterableDataset
 
-transformers.logging.set_verbosity_info()
+from fla.models import *
+from fla.models import GLAConfig, RWKV6Config, RetNetConfig, MambaConfig, Mamba2Config, GatedDeltaNetConfig
+FLA_MODEL_NAME_MAPPING = {
+    'rwkv6': 'RWKV6',
+    'gla': 'GLA',
+    'retnet': 'RetNet',
+    'mamba': 'Mamba',
+    'gated_deltanet': 'GatedDeltaNet',
+    'mamba2': 'Mamba2',
+}
+
+IB_MODEL_NAME_MAPPING = {
+    'ib2': None,
+    'bibs2': None
+}
+CPU_COUNT = os.cpu_count()
+
 
 @dataclass
 class ModelArguments:
@@ -42,15 +62,11 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
-    use_flash_attention_2: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
-    model_max_position_embeddings: int = field(
-        default=1024,
-        metadata={"help": "Maximum position embeddings."},
+    context_len: int = field(
+        default=2048,
+        metadata={"help": "Training Context Length."},
     )
-    rope_scaling_type: Optional[str] = field(default=None)
-    rope_scaling_factor: float = field(default=1.0)
     resume_from_checkpoint: Optional[bool] = field(default=None)
     finetune_from_pretrained: Optional[str] = field(default=None)
 
@@ -63,140 +79,223 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
-def load_json_dataset(training_args, dataset_dir, sanity_check=False, streaming=True):
-    import os, glob, random, copy
-    dataset_subsample_rate = 0.1
-    test_split_percentage = 0.03
-    def uniform_sample_list(file_list, subsample_rate):
-        if not 0 < subsample_rate <= 1:
-            raise ValueError(f'subsample_rate wrong: {subsample_rate}')
-
-        sample_size = int(len(file_list) * subsample_rate)
-        return random.sample(file_list, sample_size)
-    def print_rank_0(*msg):
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        if local_rank != 0:
-            return
-        print(*msg)
-
-    if not os.path.exists(dataset_dir):
-        raise ValueError(f'The sepcified data path does not exist: {dataset_dir}')
-
-    data_files = {
-        'train': [],
-        'validation': [],
-        'test': []
-    }
-
-    # json_suffices = ['jsonl.zstd', 'jsonl.zst', "json"]
-    # for suffix in json_suffices:
-    suffix = "json"
-    data_files['train'] += glob.glob(f'*train*.{suffix}', root_dir=dataset_dir, recursive=True)
-    data_files['validation'] += glob.glob(f'*validation*.{suffix}', root_dir=dataset_dir, recursive=True)
-
-    data_files['train'] = sorted(data_files['train'])
-    data_files['train'] = [os.path.join(dataset_dir, filename) for filename in data_files['train']]
-    data_files['validation'] = sorted(data_files['validation'])
-    data_files['validation'] = [os.path.join(dataset_dir, filename) for filename in data_files['validation']]
-    # print(data_files['train'][0])
-    # print(data_files['validation'][0])
-
-    if dataset_subsample_rate is not None and dataset_subsample_rate < 1.0:
-        data_files['train'] = uniform_sample_list(data_files['train'], dataset_subsample_rate)
+def get_processed_dataset(tokenizer, data_args, training_args, cached='tokenized'):
 
 
-    if test_split_percentage > 0.:
-        # total_valid_files = max(1, int(len(data_files['train']) * data_args.validation_split_percentage))
-        # stride = math.floor(len(data_files['train']) / total_valid_files)
-        # data_files['test'] = copy.deepcopy(data_files['train'][::stride])
+    # "../../hf_datasets/SlimPajama-627B"
+    dpt = data_args.dataset_cache_dir
 
-        data_files['test'] = copy.deepcopy(uniform_sample_list(data_files['train'], test_split_percentage))
-        data_files['train'] = [fn for fn in data_files['train'] if fn not in data_files['test']]
+    assert cached in ['raw', 'tokenized', 'grouped'], "cached should be one of ['raw', 'tokenized', 'grouped']"
+    if cached == 'grouped':
+        print("Loading datasets: Grouped")
+        lm_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_test_*.arrow"},
+            num_proc=CPU_COUNT,
+            split=None
+        )
+        return lm_datasets
 
-    # only load one shard for a quick test
-    if sanity_check:
-        data_files['train'] = data_files['train'][:1]
-        if len(data_files['test']) > 1:
-            data_files['test'] = data_files['test'][:1]
+    elif cached == 'raw':
+        raw_datasets = load_dataset("json",  # 本地路径
+            data_files={
+                "train": f"{dpt}/train/*/*.jsonl.zst",
+                "validation": f"{dpt}/validation/*/*.jsonl.zst",
+                "test": f"{dpt}/test/*/*.jsonl.zst"
+            },
+            num_proc=CPU_COUNT,
+            split=None,
+        )
 
-    # remove train/test set to accelerate data loading if training/validation only
-    if 'debug' in training_args.output_dir:
-        data_files['validation'] = [data_files['validation'][0]]
-        data_files["test"] = [data_files["test"][0]]
+        column_names = raw_datasets["train"].column_names
+        text_column_name = "text" if "text" in column_names else column_names[0]
 
-    if not training_args.do_train:
-        data_files['train'] = []
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name])
 
-    if not training_args.do_eval:
-        data_files['validation'] = []
-    
-    if not training_args.do_predict:
-        data_files["test"] = []
 
-    print_rank_0(f"Loading json dataset from {dataset_dir}, {len(data_files.get('train', []))} train files, {len(data_files.get('test', []))} test files")
-    raw_datasets = load_dataset("json", data_files=data_files, streaming=streaming)
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=column_names,
+            num_proc=CPU_COUNT,
+            load_from_cache_file=True,
+            cache_file_names={"train": f"{data_args.dataset_cache_dir}/tokenized_datasets_train.arrow",\
+                "validation": f"{data_args.dataset_cache_dir}/tokenized_datasets_validation.arrow", \
+                "test": f"{data_args.dataset_cache_dir}/tokenized_datasets_test.arrow"},
+            desc="Running tokenizer on dataset",
+        )
+    elif cached == 'tokenized':
+        tokenized_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/tokenized_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/tokenized_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/tokenized_datasets_test_*.arrow"
+            },
+            num_proc=CPU_COUNT,
+            split=None
+        )
 
-    return raw_datasets
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        total_length = (total_length // training_args.context_len) * training_args.context_len
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + training_args.context_len] for i in range(0, total_length, training_args.context_len)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    os.makedirs(f"{data_args.dataset_cache_dir}/{training_args.context_len}", exist_ok=True)
+
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        num_proc=CPU_COUNT,
+        load_from_cache_file=True,
+        cache_file_names={"train": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_train.arrow",\
+            "validation": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_validation.arrow", \
+            "test": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_test.arrow"},
+        desc=f"Grouping texts in chunks of {training_args.context_len}",
+    )
+    return lm_datasets
+
+def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized'):
+
+    # "../../hf_datasets/SlimPajama-627B"
+    dpt = data_args.dataset_cache_dir
+
+    assert cached in ['raw', 'tokenized', 'grouped'], "cached should be one of ['raw', 'tokenized', 'grouped']"
+
+    if cached == 'grouped':
+        print("Loading datasets: Grouped")
+        lm_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_test_*.arrow"},
+            split=None,
+            streaming=True
+        )
+        return lm_datasets
+
+    elif cached == 'tokenized':
+        tokenized_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/tokenized_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/tokenized_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/tokenized_datasets_test_*.arrow"
+            },
+            split=None,
+            streaming=True
+        )
+
+    else: # raw
+        raw_datasets = load_dataset("json",  # 本地路径
+            data_files={
+                "train": f"{dpt}/train/*/*.jsonl.zst",
+                "validation": f"{dpt}/validation/*/*.jsonl.zst",
+                "test": f"{dpt}/test/*/*.jsonl.zst"
+            },
+            # num_proc=CPU_COUNT,
+            split=None,
+            streaming=True
+        )
+
+        def infer_columns_of_dataset(raw_datasets):
+            default_cols = raw_datasets.features
+        
+            if default_cols is not None:
+                return list(default_cols)
+        
+            first_example = next(iter(raw_datasets))
+            if isinstance(first_example, dict):
+                return list(first_example.keys())
+            else:
+                raise ValueError(f'Unable to infer column names from the data type: {type(first_example)}')
+
+
+        # column_names = raw_datasets["train"].column_names
+        column_names = infer_columns_of_dataset(raw_datasets["train"])
+        text_column_name = "text" if "text" in column_names else column_names[0]
+
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name])
+        
+
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=column_names,
+        )
+
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        total_length = (total_length // training_args.context_len) * training_args.context_len
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + training_args.context_len] for i in range(0, total_length, training_args.context_len)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    os.makedirs(f"{data_args.dataset_cache_dir}/{training_args.context_len}", exist_ok=True)
+
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+    )
+
+    return lm_datasets
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+
+    def make_rank0_print(training_args):
+        def _print(*args, **kwargs):
+            if training_args.process_index == 0:
+                builtins.print(*args, **kwargs)
+        return _print
+
+    #! affecting all processes
+    print = make_rank0_print(training_args)
+
+    #! Config and Model
+    count_func = lambda model: sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
     if model_args.config_name:
-        config = MyLlamaConfig.from_pretrained(model_args.config_name)
+        config = AutoConfig.for_model(model_args.config_name, hidden_size=1024)
+        if model_args.config_name in ['mamba2', 'ibm2']:
+            config.num_heads = 32
+        model = AutoModelForCausalLM.from_config(config)
+        # if training_args.local_rank == 0:
+        print(f"Training new model from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")
     elif model_args.model_name_or_path:
-        config = MyLlamaConfig.from_pretrained(model_args.model_name_or_path)
+        # config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
+        # if training_args.local_rank == 0:
+        print(f"Finetuning model from {model_args.model_name_or_path} - Model Size={count_func(model)/2**20:.2f}M parameters")
     else:
         raise NotImplementedError
-
-    type = model_args.config_name.split('/')[-1].split('.')[0]
-    if type != config.rpe_type:
-        assert config.rpe_type == 'adape', f"Not matched positional embeddding method for config file {type}.json and config content {config.rpe_type}. There's a chance you ran a method not meeting your expectations."
-
-    # complete configuration
-    scaled_max_position_embeddings=int(training_args.model_max_position_embeddings * training_args.rope_scaling_factor)
-    config.max_position_embeddings=scaled_max_position_embeddings
-    config.use_flash_attention_2 = training_args.use_flash_attention_2
-
-    if training_args.rope_scaling_type is not None:
-        config.rope_scaling = {
-            "type": training_args.rope_scaling_type,
-            "factor": training_args.rope_scaling_factor
-            }
-        # if 'yarn' in training_args.rope_scaling_type:
-        config.original_max_position_embeddings = training_args.model_max_position_embeddings
-    elif config.rpe_type in ['yarn', 'adayarn']:
-        config.rope_scaling = {
-            "type": config.rpe_type,
-            "factor": training_args.rope_scaling_factor
-            }
-        config.original_max_position_embeddings = training_args.model_max_position_embeddings
-        
-    try:
-        module_name = config.rpe_type
-        MyLlamaForCausalLM = __import__(f"models.llama.{module_name}", fromlist=["MyLlamaForCausalLM"]).MyLlamaForCausalLM
-    except Exception as e:
-        print(e)
-        rpe_types = [
-            "rope", "sincos", "randrope", "alibi", "adape", "yarn", 
-            "t5rb", "fire", "xpos", "nope", "adayarn", "adalibi",
-        ]
-        raise NotImplementedError(f"Unknown positional embedding {module_name}, choose from {rpe_types}")
-
-
-    if model_args.model_name_or_path:
-        model = MyLlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
-        )
-        if training_args.local_rank == 0:
-            n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-            print(f"Finetuning model from {model_args.model_name_or_path} - Model Size={n_params/2**20:.2f}M parameters")
-    else:
-        model = MyLlamaForCausalLM(config)
-        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-        if training_args.local_rank == 0:
-            print(f"Training new model from scratch - Total Size={n_params/2**20:.2f}M parameters")
 
     # determine if load from pretrained
     # if training_args.finetune_from_pretrained:
@@ -210,73 +309,17 @@ def train():
     #     filtered_checkpoint = {k: v for k, v in checkpoint.items() if filter(k)}
     #     model.load_state_dict(filtered_checkpoint, strict=False)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        "./models/llama/llama_tokenizer",
-        use_fast=True,
-    )
-
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     "/cusp-data-efa/peihaow/hf_models/llama-tokenizer",
+    #     use_fast=True,
+    # )
  
-    
-    # raw_datasets = load_dataset("allenai/c4", "en", streaming=True)
-    raw_datasets = load_json_dataset(training_args, "/scratch/gpfs/DATASETS/hugging_face/c4/en")
-
-    def infer_columns_of_dataset(raw_datasets):
-        default_cols = raw_datasets.features
-    
-        if default_cols is not None:
-            return list(default_cols)
-    
-        first_example = next(iter(raw_datasets))
-        if isinstance(first_example, dict):
-            return list(first_example.keys())
-        else:
-            raise ValueError(f'Unable to infer column names from the data type: {type(first_example)}')
-
-    if training_args.do_train:
-        column_names = infer_columns_of_dataset(raw_datasets["train"])
-    else:
-        column_names = infer_columns_of_dataset(raw_datasets["test"])
-
-    def tokenize_function(examples):
-        output = tokenizer(examples["text"])
-        return output
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", use_fast=True)
 
     if training_args.local_rank > 0: 
         torch.distributed.barrier()
 
-    os.makedirs(f"{data_args.dataset_cache_dir}/tokenized", exist_ok=True)
-    tokenized_datasets = raw_datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=column_names,
-    )
-
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        block_size = config.train_scale
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-
-        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i: i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-
-        return result
-
-    os.makedirs(f"{data_args.dataset_cache_dir}/{config.train_scale}", exist_ok=True)
-    lm_datasets = tokenized_datasets.map(
-        group_texts,
-        batched=True,
-    )
+    lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args, cached='grouped')
 
     if training_args.local_rank == 0:
         print(f"rank{training_args.local_rank} loading datasets")
@@ -298,7 +341,7 @@ def train():
     model.is_parallelizable = True
     model.model_parallel = True
 
-    #! specially for skip streaming dataset for later batch.
+    #! For Iteratable: do not skip streaming dataset but use a new shuffle for resume.
     n_lastest_iter = 0
     if training_args.resume_from_checkpoint == True:
         # search for the latest checkpoint
@@ -322,6 +365,7 @@ def train():
         print("*** Set ignore_data_skip=True for streaming mode to save time ***")
 
 
+
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     model.config.use_cache = False
 
@@ -340,4 +384,11 @@ def train():
         
 
 if __name__ == "__main__":
+    wandb.init(
+        project="IBSSM",
+        entity="jiajun_vita",
+        id=os.getenv("SLURM_JOB_NAME"),
+        resume='allow',
+        )
+    transformers.logging.set_verbosity_warning()
     train()
