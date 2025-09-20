@@ -1,5 +1,5 @@
 #!/bin/sh
-#SBATCH --output=/cusp-data-efa/peihaow/jz/IBSSM/logs/train_%x_%j.log
+#SBATCH --output=/cusp-data-efa/peihaow/jz/IBSSM/logs/pretrain_%x_%j.log
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1         # One task per GPU? per node
 #SBATCH --gres=gpu:8
@@ -61,7 +61,7 @@ srun torchrun --nproc_per_node $NGPUS --nnodes $NNODES \
         --rdzv_backend c10d \
         pretrain.py \
         --deepspeed "ds_config.json" \
-        --dataset_cache_dir "../../hf_datasets/SlimPajama-627B" \
+        --dataset_cache_dir "/vcc-data/peihaow/SlimPajama-627B" \
         --output_dir "output/${METHOD}" \
         --config_name ${METHOD} \
         --resume_from_checkpoint true \

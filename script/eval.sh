@@ -13,7 +13,7 @@ for i in "${!method_list[@]}"; do
 
     python eval_harness.py --model fla \
         --model_args pretrained=$model_path \
-        --tasks truthfulqa_mc1,truthfulqa_mc2 \
+        --tasks arc_easy,winogrande,boolq,piqa,gpqa,mmlu,openbookqa,social_iqa,truthfulqa_mc1,truthfulqa_mc2 \
         --batch_size 64 --device cuda:$device > "$log_file" 2>&1 &
 done
 

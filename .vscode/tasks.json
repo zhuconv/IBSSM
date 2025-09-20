@@ -1,0 +1,40 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        // {
+        //     "label": "startup",
+        //     "type": "shell",
+        //     "command": "srun -n1 python ${relativeFile}",
+        // },
+        {
+            "label": "launch",
+            "type": "shell",
+            "command": "source ~/.bashrc && conda activate ibm && cd /cusp-data-efa/peihaow/jz/IBSSM && bash ${workspaceFolder}/.vscode/submit.sh \"${config:SLURM_SBATCH_FLAGS}\"",
+            
+        },
+        {
+            "label": "connect",
+            "type": "shell",
+            "command": "bash ${workspaceFolder}/.vscode/connect.sh ${config:SOCAT_PORT}",
+            "dependsOn":["launch"],
+            "isBackground": true,
+            "problemMatcher": [
+                {
+                  "pattern": [
+                    {
+                      "regexp": ".",
+                      "file": 1,
+                      "location": 2,
+                      "message": 3
+                    }
+                  ],
+                  "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": ".",
+                    "endsPattern": ".",
+                  }
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,4 @@
+{
+    "SLURM_SBATCH_FLAGS": "--partition=p4-main --time=1:00:00",
+    "SOCAT_PORT": 5000
+}

@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "slurm-debug",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": {
+                "host": "127.0.0.1",
+                "port": "${config:SOCAT_PORT}"
+            },
+            "justMyCode": false,
+            // "preLaunchTask": "connect"
+        },
+    ]
+}

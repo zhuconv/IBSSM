@@ -25,14 +25,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import wandb
-import torch
-import torch.distributed
 import transformers
 from transformers import Trainer, default_data_collator, AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from datasets import load_dataset, load_from_disk, IterableDataset
 
 from fla.models import *
-from fla.models import GLAConfig, RWKV6Config, RetNetConfig, MambaConfig, Mamba2Config, GatedDeltaNetConfig
+# from fla.models import GLAConfig, RWKV6Config, RetNetConfig, MambaConfig, Mamba2Config, GatedDeltaNetConfig
+
 FLA_MODEL_NAME_MAPPING = {
     'rwkv6': 'RWKV6',
     'gla': 'GLA',
@@ -42,10 +41,12 @@ FLA_MODEL_NAME_MAPPING = {
     'mamba2': 'Mamba2',
 }
 
+
 IB_MODEL_NAME_MAPPING = {
-    'ib2': None,
-    'bibs2': None
+    'ib2': 'IBM2',
+    'bibs2': 'BIBS2',
 }
+
 CPU_COUNT = os.cpu_count()
 
 
@@ -80,7 +81,6 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
 def get_processed_dataset(tokenizer, data_args, training_args, cached='tokenized'):
-
 
     # "../../hf_datasets/SlimPajama-627B"
     dpt = data_args.dataset_cache_dir
@@ -316,26 +316,24 @@ def train():
  
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", use_fast=True)
 
-    if training_args.local_rank > 0: 
-        torch.distributed.barrier()
+    # if training_args.local_rank > 0: 
+    #     torch.distributed.barrier()
 
     lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args, cached='grouped')
 
-    if training_args.local_rank == 0:
-        print(f"rank{training_args.local_rank} loading datasets")
-
-    if training_args.local_rank == 0:
-        print(f"rank{training_args.local_rank} datasets loaded")
+    print(f"*** Datasets Loaded ***")
 
     train_dataset = lm_datasets["train"]
     valid_dataset = lm_datasets["validation"]
 
-    if training_args.local_rank == 0:
-        torch.distributed.barrier()
+    # if training_args.local_rank == 0:
+    #     torch.distributed.barrier()
     
     data_collator = default_data_collator # DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
-    data_module = dict(train_dataset=train_dataset, eval_dataset=valid_dataset, data_collator=data_collator)
+    data_module = dict(
+        train_dataset=train_dataset, eval_dataset=valid_dataset, data_collator=data_collator
+        )
 
     # Tell Trainer not to attempt DataParallel
     model.is_parallelizable = True
@@ -387,7 +385,7 @@ if __name__ == "__main__":
     wandb.init(
         project="IBSSM",
         entity="jiajun_vita",
-        id=os.getenv("SLURM_JOB_NAME"),
+        id=os.getenv("SLURM_JOB_NAME", "interact"),
         resume='allow',
         )
     transformers.logging.set_verbosity_warning()
