@@ -24,7 +24,7 @@ from itertools import chain
 from dataclasses import dataclass, field
 from typing import Optional
 
-import wandb
+# import wandb
 import transformers
 from transformers import Trainer, default_data_collator, AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from datasets import load_dataset, load_from_disk, IterableDataset
@@ -283,9 +283,16 @@ def train():
     #! Config and Model
     count_func = lambda model: sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
     if model_args.config_name:
+        if model_args.config_name in ['ibm2b', 'ibm2g']:
+            model_args.config_name = 'ibm2'
+            ib_type = 'bernoulli' if '2b' in model_args.config_name else 'gamma'
+        else:
+            ib_type = None
         config = AutoConfig.for_model(model_args.config_name, hidden_size=1024)
         if model_args.config_name in ['mamba2', 'ibm2']:
             config.num_heads = 32
+            if ib_type is not None:
+                config.ib_type = ib_type
         model = AutoModelForCausalLM.from_config(config)
         # if training_args.local_rank == 0:
         print(f"Training new model from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")
@@ -382,11 +389,11 @@ def train():
         
 
 if __name__ == "__main__":
-    wandb.init(
-        project="IBSSM",
-        entity="jiajun_vita",
-        id=os.getenv("SLURM_JOB_NAME", "interact"),
-        resume='allow',
-        )
+    # wandb.init(
+    #     project="IBSSM",
+    #     entity="jiajun_vita",
+    #     id=os.getenv("SLURM_JOB_NAME", "interact"),
+    #     resume='allow',
+    #     )
     transformers.logging.set_verbosity_warning()
     train()

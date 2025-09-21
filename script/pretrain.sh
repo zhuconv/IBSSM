@@ -8,13 +8,13 @@
 #SBATCH --partition=p4-main
 #SBATCH --time=1-00:00:00
 
-source ~/.bashrc
-conda activate ibm
-cd /cusp-data-efa/peihaow/jz/IBSSM
+# source ~/.bashrc
+# conda activate ibm
+# cd /cusp-data-efa/peihaow/jz/IBSSM
 
 export LOGLEVEL=INFO
 export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
-export WANDB_MODE=offline 
+export WANDB_MODE=disabled 
 export CUDA_LAUNCH_BLOCKING=1
 
 
@@ -24,16 +24,19 @@ if [[ -z "$SLURM_JOB_NODELIST" ]]; then
     head_node=$(hostname)
     nodes=("$head_node")
     NNODES=1
+    command="torchrun"
+    NGPUS=1
+    METHOD=${METHOD:-"ibm2"}
 else
     nodes=($(scontrol show hostnames $SLURM_JOB_NODELIST))
     head_node=${nodes[0]}
     NNODES=${#nodes[@]}
+    command="srun torchrun"
+    METHOD=$SLURM_JOB_NAME
 fi
 head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 echo "Head Node IP: $head_node_ip; NNODES: $NNODES"
 
-METHOD=$SLURM_JOB_NAME
-METHOD=${METHOD:-"ibm2"}
 NGPUS=${NGPUS:-8}
 
 ### Hyperparameters
@@ -55,24 +58,33 @@ batch_size=$(( local_batch_size / NGPUS ))
 gradient_accumulation_steps=$(( batch_size / micro_batch_size ))
 max_steps=$(( max_tokens / (global_batch_size * 4096) )) 
 
-srun torchrun --nproc_per_node $NGPUS --nnodes $NNODES \
+# ../../hf_datasets/SlimPajama-627B
+# "/vcc-data/peihaow/SlimPajama-627B"
+
+# python -m debugpy --wait-for-client --listen 0.0.0.0:5000 -m torch.distributed.launch
+
+${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --rdzv_endpoint $head_node_ip:29523 \
         --rdzv_id $RANDOM \
         --rdzv_backend c10d \
         pretrain.py \
         --deepspeed "ds_config.json" \
-        --dataset_cache_dir "/vcc-data/peihaow/SlimPajama-627B" \
+        --dataset_cache_dir "../../hf_datasets/SlimPajama-627B" \
         --output_dir "output/${METHOD}" \
         --config_name ${METHOD} \
         --resume_from_checkpoint true \
         --per_device_train_batch_size $micro_batch_size \
         --gradient_accumulation_steps $gradient_accumulation_steps \
+        --report_to none \
         --max_steps $max_steps \
         --context_len 4096 \
         --warmup_ratio 0.01 \
-        --weight_decay 0.05 \
+        --weight_decay 0.1 \
         --learning_rate 4e-4 \
-        --lr_scheduler_type polynomial \
+        --adam_beta1 0.9 \
+        --adam_beta2 0.98 \
+        --lr_scheduler_type cosine_with_min_lr \
+        --lr_scheduler_kwargs '{"min_lr_rate": 0.1}' \
         --save_steps 1000 \
         --save_total_limit 2 \
         --logging_steps 50 \

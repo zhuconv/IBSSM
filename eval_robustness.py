@@ -6,6 +6,8 @@ from promptbench.models import LLMModel
 from promptbench.prompt_attack import attack_config
 # attack_config["goal_function"]['query_budget'] = 100  # set the query budget to 100
 
+
+
 from promptbench.prompt_attack import Attack
 
 def parse_args():
@@ -48,6 +50,7 @@ def main():
 
 
     # create prompt
+    promtp = """As a sentiment classifier, determine whether the following text is "positive" or "negative". Only output one word: either "positive" or "negative". No explanation. \nText: {content}\nAnswer:"""
     prompt = "As a sentiment classifier, determine whether the following text is 'positive' or 'negative'. Please classify: \nQuestion: {content}\nAnswer:"
 
     # define the projection function required by the output process

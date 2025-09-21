@@ -44,6 +44,6 @@ srun torchrun --nnodes=${NNODES} --nproc_per_node=8 --rdzv_id=$RDVZ_ID --rdzv_ba
     --hf_model_name_or_path $model_path \
     --data_dir ./data/crystal_chat/2048 \
     --output_dir ./output/${method}_7b \
-    --n_chunks 10 \
+    --n_chunks 7 \
     --per_device_batch_size 1 \
     --accumulate_grad_batches 1 # > log/gibs.log 2>&1 &

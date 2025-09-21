@@ -6,9 +6,9 @@ EVAL_SCRIPT="eval_robustness.py"
 
 # models (use the paths you want)
 declare -A MODELS
-# MODELS["ibm2"]="output/ibm2_7b/ckpt_3"
-# MODELS["mamba2"]="output/mamba2_7b/ckpt_3"
-MODELS["codestral"]="mistralai/Mamba-Codestral-7B-v0.1"
+MODELS["ibm2"]="output/ibm2_7b/ckpt_4"
+MODELS["mamba2"]="output/mamba2_7b/ckpt_2"
+# MODELS["codestral"]="mistralai/Mamba-Codestral-7B-v0.1"
 
 # MODELS=(
 #   "ibm2"
@@ -21,11 +21,12 @@ MODELS["codestral"]="mistralai/Mamba-Codestral-7B-v0.1"
 ATTACKS=(
   "stresstest"
   "checklist"
-  "bertattack"
-  "textfooler"
-  "textbugger"
   "deepwordbug"
 )
+
+  # "textbugger"
+  # "bertattack"
+  # "textfooler"
 
 # log dir
 LOGDIR="logs/robust"
@@ -39,7 +40,7 @@ if [ ${TOTAL_TASKS} -gt 8 ]; then
   exit 1
 fi
 
-task_idx=0
+task_idx=4
 for model in "${!MODELS[@]}"; do
   for attack in "${ATTACKS[@]}"; do
     gpu=$(( task_idx ))   # maps to 0..7
