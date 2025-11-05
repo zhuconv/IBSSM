@@ -1,13 +1,15 @@
 # method_list=('RWKV6' 'GLA' 'RetNet' 'Mamba' 'GatedDeltaNet' 'Mamba2' 'BIBS2' 'SSIB2')
 method_list=('gla') # 'rwkv6' 'mamba' 'mamba2' 'gated_deltanet' 'retnet' 'ibm2')
-method_list=('mamba2_7b/ckpt_3' 'ibm2_7b/ckpt_5')
+method_list=('ibm2g' 'ibm2g_7b/ckpt_6')
+method_list=('mistralai/Mamba-Codestral-7B-v0.1')
 # arc_easy,winogrande,boolq,piqa,gpqa_main_n_shot,mmlu,openbookqa,social_iqa,truthfulqa_mc1,truthfulqa_mc2
 
 for i in "${!method_list[@]}"; do
     method="${method_list[$i]}"
     device="$i"  # 一个 method 对应一个 GPU
     
-    model_path="output/${method}"
+    # model_path="output/${method}"
+    model_path=$([[ "$method" == *mistral* ]] && echo "$method" || echo "output/$method")
     method_log_name="${method//\//_}"
     log_file="logs/harness/eval_${method_log_name}.log"
     

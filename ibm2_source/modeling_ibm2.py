@@ -243,7 +243,7 @@ class GammaIB4dt(nn.Module):
         self._auxiliary_loss = 0
         self.epoch_frac = 0
         self.epoch_threshold = 0.0
-        self.normalizer = Normalize(max_value=10, min_value=0.1)
+        self.normalizer = Normalize(max_value=10) #, min_value=0.1)
         self.max_seqlen = max_seqlen
         self._attn = None
 
@@ -262,13 +262,13 @@ class GammaIB4dt(nn.Module):
         # shape: [bsz, seq_len, 1]
         if self.alphas is None:
             length = self.max_seqlen # param_alphas.shape[1]
-            maxmimum = 8
+            minimum = 1
         else:
             length = param_alphas.size(1)
             assert length > self.max_seqlen
             self.max_seqlen = param_alphas.size(1)
-            maxmimum = param_alphas.size(1) / self.alphas.size(0) * self.alphas.max().item()
-        alphas = torch.linspace(maxmimum, 1, steps=length).float().to(param_alphas.device) # distance-decay: torch.linspace(1, 2, steps=length)
+            minimum = self.alphas.min().item() / (param_alphas.size(1) / self.alphas.size(0)) # self.alphas should be negative (it is log)
+        alphas = torch.linspace(minimum, 2, steps=length).float().to(param_alphas.device) # distance-decay: torch.linspace(1, 2, steps=length)
         self.alphas = alphas
         return alphas
 
@@ -283,42 +283,47 @@ class GammaIB4dt(nn.Module):
             alphas = self.init_alphas(param_alphas)
             print(f"Gamma prior alpha first: {self.alphas[0]}, last: {self.alphas[-1]}, size: {self.alphas.size(0)}", )
         
-        prior_alphas = alphas.expand(param_alphas.shape)
-        reg_loss = (torch.lgamma(prior_alphas) - torch.lgamma(param_alphas) + (param_alphas - prior_alphas) * torch.digamma(param_alphas))
+        # alphas is initialized as log
+        # import os
+        # import pdb
+        # local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # if local_rank == 0:
+        #     pdb.set_trace()
+
+        prior_alphas = torch.exp(alphas).unsqueeze(-1).expand(param_alphas.shape)
+        reg_loss = - torch.log(prior_alphas) + torch.log(param_alphas) + prior_alphas / (param_alphas + 1e-10)
+        # reg_loss = (torch.lgamma(prior_alphas) - torch.lgamma(param_alphas) + (param_alphas - prior_alphas) * torch.digamma(param_alphas))
 
         return reg_loss.mean(dim=-1)
 
-    def forward(self, dt, dt_bias, **kwargs):
+    def forward(self, dt, dt_bias, A):
         # hidden_states shape [bsz, seq_length, dimension]
         dt_plus = F.softplus(dt + dt_bias)
         # input_dtype = dt.dtype 
         # states = dt.to(torch.float32)
 
         if self.epoch_frac < self.epoch_threshold:
-            return dt
+            return dt, A
         # alphas = F.rms_norm(alphas, [hidden_states.shape[1], 1])
         # alphas = F.softplus(alphas)
-        tok_avg_dt = dt_plus.mean(dim=-1)
+
+        # tok_dt_plus = dt_plus.mean(dim=-1)
         # shaped_alphas = alphas.expand(-1, -1, dt_plus.shape[2])
         if self.training:
-            # normed, scale_factor, shift_factor = self.normalizer(dt_plus)
+            self._auxiliary_loss = self.compute_loss(dt_plus)
+            # normed_dt, scale_factor, shift_factor = self.normalizer(dt_plus)
             # alphas / betas = hidden_states.abs()
             # betas = torch.reciprocal(normalized_value_states)
-            betas = torch.ones_like(tok_avg_dt).to(device=tok_avg_dt.device).to(dtype=tok_avg_dt.dtype)
-            gamma_dist = torch.distributions.gamma.Gamma(tok_avg_dt, betas)
-            sampled_avg_dt = gamma_dist.rsample()
+            concentration = torch.ones_like(dt_plus).to(device=dt_plus.device).to(dtype=dt_plus.dtype)
+            gamma_dist = torch.distributions.gamma.Gamma(concentration, torch.reciprocal(dt_plus))
+            sampled_dt = gamma_dist.rsample()
             # Restore the original scale
             # if shift_factor is not None:
-            #     time_states = samples / scale_factor - shift_factor / scale_factor
+            #     sampled_dt = sampled_dt / scale_factor - shift_factor / scale_factor
             # else:
-            #     time_states = samples / scale_factor
-            # import os
-            # import pdb
-            # local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            # if local_rank == 0:
-            #     pdb.set_trace()
-            self._auxiliary_loss = self.compute_loss(sampled_avg_dt)
-            sampled_dt = (sampled_avg_dt / tok_avg_dt).unsqueeze(-1) * dt_plus 
+            #     sampled_dt = sampled_dt / scale_factor
+
+            # self._auxiliary_loss = self.compute_loss(sampled_dt)
             dt = sampled_dt + torch.log(-torch.expm1(-sampled_dt)) # inverse of softplus
         else:
             pass # outer calculation is same as expectation
@@ -327,7 +332,7 @@ class GammaIB4dt(nn.Module):
         #     pass # seqlen == 1 indicates it is caching
         # else:
         #     self._attn = alphas.squeeze() # torch.exp(-time_states).mean(dim=-1).detach().cpu()
-        return dt
+        return dt, A
 
 
 class BernoulliIB4dA(nn.Module):
@@ -405,18 +410,20 @@ class BernoulliIB4dA(nn.Module):
         # if self.epoch_frac < self.epoch_threshold:
         #     return hidden_states
         if self.training:
+            self._auxiliary_loss = self.compute_loss(p_bern)
             logit = torch.logit(p_bern, eps=1e-6)
             # dA is log(p_bern)
             # gumble soft-max
             random_noise = torch.empty_like(logit).uniform_(1e-10, 1 - 1e-10)
             random_noise = torch.log(random_noise) - torch.log(1.0 - random_noise)
             sampled_bern = ((logit + random_noise) / self.temp).sigmoid()
+            new_A =  torch.log(sampled_bern) / dt_plus
             #! loss backward is hanled in another func outside
-            self._auxiliary_loss = self.compute_loss(sampled_bern)
+            return dt, new_A
         else:
             pass # just same as outer calculation
         
-        return dt
+        return dt, A
 
 class IBM2Mixer(nn.Module):
     """
@@ -532,8 +539,9 @@ class IBM2Mixer(nn.Module):
                 [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
             )
             #! HACK IBS forward function part
+
             if self.ib:
-                dt = self.ib(dt, self.dt_bias, A=A)
+                dt, A = self.ib(dt, self.dt_bias, A=A)
                 #! For IBM interpretration
                 if self.return_attn:
                     dt_plus = F.softplus(dt + self.dt_bias)
@@ -595,6 +603,7 @@ class IBM2Mixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             #! HACK IBS forward function part
+
             if self.ib:
                 # self.intermediate_size: self.d_ssm
                 # self.ssm_state_size: d_state
@@ -1356,7 +1365,7 @@ class IBM2ForCausalLM(IBM2PreTrainedModel):
             #         auxiliary_loss.append(module.get_auxiliary_loss())
             self.apply(collect_auxiliary_loss)
             kl_loss = torch.mean(torch.stack(auxiliary_loss, dim=0)) * len(auxiliary_loss) * self.config.auxiliary_loss_weight if len(auxiliary_loss) > 0 else 0.0
-            print(kl_loss)
+            # print(kl_loss)
             # kl_loss = sum(auxiliary_loss) * self.config.auxiliary_loss_weight if len(auxiliary_loss) > 0 else 0.0
             loss = ce_loss + kl_loss
 

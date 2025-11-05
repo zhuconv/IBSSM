@@ -293,6 +293,7 @@ def train():
             config.num_heads = 32
             if ib_type is not None:
                 config.ib_type = ib_type
+                config.auxiliary_loss_weight = 1e-6 if ib_type == 'gamma' else 1e-1
         model = AutoModelForCausalLM.from_config(config)
         # if training_args.local_rank == 0:
         print(f"Training new model from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")

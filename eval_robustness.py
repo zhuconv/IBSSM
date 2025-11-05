@@ -30,7 +30,7 @@ def parse_args():
                         help="Sampling temperature for the model (default: 0.2)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
-    parser.add_argument("--verbose", action="store_true",
+    parser.add_argument("--verbose", action="store_false", default=True,
                         help="Verbose attack printing")
     return parser.parse_args()
 
@@ -50,21 +50,33 @@ def main():
 
 
     # create prompt
-    promtp = """As a sentiment classifier, determine whether the following text is "positive" or "negative". Only output one word: either "positive" or "negative". No explanation. \nText: {content}\nAnswer:"""
-    prompt = "As a sentiment classifier, determine whether the following text is 'positive' or 'negative'. Please classify: \nQuestion: {content}\nAnswer:"
+    wnli_prompt = """Please classify the following sentence pair. Answer "entailment" if the second sentence follows from the first, otherwise answer "not_entailment".\n\nSentences: {content}\nAnswer:"""
+    wnli_prompt = """{sentence1}\nQuestion: {sentence2} True or False?\nAnswer:"""
+    sst2_prompt = """Please classify the sentiment of the following sentence. Answer "positive" if the sentiment is positive, otherwise answer "negative".\nQuestin: {content}\nAnswer:"""
+    # prompt = "As a sentiment classifier, determine whether the following text is 'positive' or 'negative'. Please classify: \nQuestion: {content}\nAnswer:"
+    if args.dataset == 'sst2':
+        prompt = sst2_prompt
+    elif args.dataset == 'wnli':
+        prompt = wnli_prompt
+    else:
+        raise NotImplementedError(f"{args.dataset} not supported")
 
     # define the projection function required by the output process
-    def proj_func(pred):
+    if args.dataset == 'sst2':
         mapping = {
             "positive": 1,
             "negative": 0
         }
+    elif args.dataset == 'wnli':
+        mapping = {
+            "true": 1,
+            "false": 0
+        }
+
+    def proj_func(pred):
         return mapping.get(pred, -1)
 
-    inv_mapping = {
-        1: "positive",
-        0: "negative"
-    }
+    inv_mapping = {v: k for k, v in mapping.items()}
 
     # define the evaluation function required by the attack
     # if the prompt does not require any dataset, for example, "write a poem", you still need to include the dataset parameter
@@ -80,9 +92,9 @@ def main():
             raw_output = model(input_text)
             raw_output = raw_output.replace("</s>", "").replace("<s>", "").strip()
             raw_output = raw_output[len(input_text):].strip()
-            # if i in indices:
-                # print(f"*** OUTPUT: {raw_output}; LABEL: {inv_mapping[d['label']]} ***")
-            
+            if i in indices:
+                # print(f"*** INPUT: {input_text} ***")
+                print(f"*** OUTPUT: {raw_output}; LABEL: {inv_mapping[d['label']]} ***")
 
             output = pb.OutputProcess.cls(raw_output, proj_func)
             preds.append(output)
@@ -94,7 +106,7 @@ def main():
     # define the unmodifiable words in the prompt
     # for example, the labels "positive" and "negative" are unmodifiable, and "content" is modifiable because it is a placeholder
     # if your labels are enclosed with '', you need to add \' to the unmodifiable words (due to one feature of textattack)
-    unmodifiable_words = ["positive\'", "negative\'", "content"]
+    unmodifiable_words = ["positive\'", "positive" "negative\'", "negative", "entailment", "entailment\'", "not_entailment\'", "not_entailment", "True", "False", "or" "content", "sentence1", "sentence2"]
 
     # print all supported attacks
     print("Supported Attacks:", Attack.attack_list())

@@ -173,11 +173,17 @@ def main(hf_model_name_or_path,
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_name_or_path, trust_remote_code=True)
 
-    if method in ['gamma', 'bernoulli', 'ibm2']:
+    if method in ['ibm2g', 'ibm2b', 'ibm2']:
         # load mamba2 model but initialize as ibm2
         from fla.models.ibm2.modeling_ibm2 import IBM2Block as Block # for FSDP auto wrap
         config = IBM2Config.from_pretrained(hf_model_name_or_path)
-        config.ib_type = method
+        # config.ib_type = method
+        if method == 'ibm2g':
+            config.ib_type = 'gamma'
+            config.auxiliary_loss_weight = 1e-10
+        elif method == 'ibm2b':
+            config.ib_type = 'bernoulli'
+            config.auxiliary_loss_weight = 1e-1
         model = IBM2ForCausalLM.from_pretrained(hf_model_name_or_path, config=config)
     elif method == 'mamba2':
         # or method == 'mamba-codestral':
