@@ -60,6 +60,7 @@ class ModelArguments:
 class DataArguments:
     dataset_cache_dir: str = field(default=None, metadata={"help": "Path to the data."})
     dataset_cached: str = field(default="grouped", metadata={"help": "Dataset cache mode: raw, tokenized, grouped, or huggingface."})
+    dataset_subset: Optional[str] = field(default=None, metadata={"help": "Subset/config name for HuggingFace datasets (e.g. sample-10BT)."})
 
 
 @dataclass
@@ -179,19 +180,24 @@ def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized
     assert cached in ['raw', 'tokenized', 'grouped', 'huggingface'], "cached should be one of ['raw', 'tokenized', 'grouped', 'huggingface']"
 
     if cached == 'huggingface':
-        # Load directly from a HuggingFace dataset hub name (e.g. "DKYoon/SlimPajama-6B")
-        raw_datasets = load_dataset(dpt, streaming=True)
+        # Load directly from a HuggingFace dataset hub name (e.g. "HuggingFaceFW/fineweb-edu")
+        subset = data_args.dataset_subset
+        raw_datasets = load_dataset(dpt, subset, streaming=True) if subset else load_dataset(dpt, streaming=True)
+
+        # If only "train" split exists, split it into train/validation
+        available_splits = list(raw_datasets.keys()) if hasattr(raw_datasets, 'keys') else ["train"]
+        if "validation" not in available_splits:
+            train_stream = raw_datasets["train"]
+            # Use skip/take to create a validation split from the first 1000 examples
+            val_stream = train_stream.take(1000)
+            train_stream = train_stream.skip(1000)
+            raw_datasets = {"train": train_stream, "validation": val_stream}
+
         column_names = list(next(iter(raw_datasets["train"])).keys())
         text_column_name = "text" if "text" in column_names else column_names[0]
 
         def tokenize_function(examples):
             return tokenizer(examples[text_column_name])
-
-        tokenized_datasets = raw_datasets.map(
-            tokenize_function,
-            batched=True,
-            remove_columns=column_names,
-        )
 
         def group_texts(examples):
             concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
@@ -204,7 +210,12 @@ def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized
             result["labels"] = result["input_ids"].copy()
             return result
 
-        lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+        lm_datasets = {}
+        for split_name, split_data in (raw_datasets.items() if hasattr(raw_datasets, 'items') else raw_datasets.items()):
+            tokenized = split_data.map(tokenize_function, batched=True, remove_columns=column_names)
+            grouped = tokenized.map(group_texts, batched=True)
+            lm_datasets[split_name] = grouped
+
         return lm_datasets
 
     elif cached == 'grouped':

@@ -71,8 +71,9 @@ ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --rdzv_backend c10d \
         pretrain.py \
         --deepspeed "ds_config.json" \
-        --dataset_cache_dir "${DATASET:-DKYoon/SlimPajama-6B}" \
+        --dataset_cache_dir "${DATASET:-HuggingFaceFW/fineweb-edu}" \
         --dataset_cached "${CACHED:-huggingface}" \
+        --dataset_subset "${DATASET_SUBSET:-sample-10BT}" \
         --output_dir "output/${METHOD}" \
         --config_name ${METHOD} \
         --resume_from_checkpoint true \
