@@ -3,9 +3,10 @@ name = "ibssm"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "accelerate>=1.13.0",
+    "causal-conv1d",
     "datasets>=4.8.4",
     "deepspeed>=0.18.8",
     "flash-attn",
@@ -24,3 +25,4 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl" }
 mamba-ssm = { url = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl" }
+causal-conv1d = { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl" }
