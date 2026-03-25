@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import fla  # noqa
+from fla.models import *  # noqa
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
