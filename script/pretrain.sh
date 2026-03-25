@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 #SBATCH --output=/cusp-data-efa/peihaow/jz/IBSSM/logs/pretrain_%x_%j.log
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1         # One task per GPU? per node
@@ -13,28 +13,30 @@
 # cd /cusp-data-efa/peihaow/jz/IBSSM
 
 export LOGLEVEL=INFO
-export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
-export WANDB_MODE=disabled 
+export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID:-0}
+export WANDB_MODE=disabled
 export CUDA_LAUNCH_BLOCKING=1
+export HF_TOKEN=${HF_TOKEN:?"Please set HF_TOKEN environment variable"}
 
 
 # --- Detect nodes ---
 if [[ -z "$SLURM_JOB_NODELIST" ]]; then
     echo "Interactive mode: no SLURM_JOB_NODELIST"
     head_node=$(hostname)
+    head_node_ip=$(hostname -I | awk '{print $1}')
     nodes=("$head_node")
     NNODES=1
     command="torchrun"
-    NGPUS=1
+    NGPUS=${NGPUS:-1}
     METHOD=${METHOD:-"ibm2"}
 else
     nodes=($(scontrol show hostnames $SLURM_JOB_NODELIST))
     head_node=${nodes[0]}
+    head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
     NNODES=${#nodes[@]}
     command="srun torchrun"
     METHOD=$SLURM_JOB_NAME
 fi
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 echo "Head Node IP: $head_node_ip; NNODES: $NNODES"
 
 NGPUS=${NGPUS:-8}
@@ -69,7 +71,8 @@ ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --rdzv_backend c10d \
         pretrain.py \
         --deepspeed "ds_config.json" \
-        --dataset_cache_dir "../../hf_datasets/SlimPajama-627B" \
+        --dataset_cache_dir "${DATASET:-DKYoon/SlimPajama-6B}" \
+        --dataset_cached "${CACHED:-huggingface}" \
         --output_dir "output/${METHOD}" \
         --config_name ${METHOD} \
         --resume_from_checkpoint true \

@@ -59,6 +59,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset_cache_dir: str = field(default=None, metadata={"help": "Path to the data."})
+    dataset_cached: str = field(default="grouped", metadata={"help": "Dataset cache mode: raw, tokenized, grouped, or huggingface."})
 
 
 @dataclass
@@ -175,9 +176,38 @@ def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized
     # "../../hf_datasets/SlimPajama-627B"
     dpt = data_args.dataset_cache_dir
 
-    assert cached in ['raw', 'tokenized', 'grouped'], "cached should be one of ['raw', 'tokenized', 'grouped']"
+    assert cached in ['raw', 'tokenized', 'grouped', 'huggingface'], "cached should be one of ['raw', 'tokenized', 'grouped', 'huggingface']"
 
-    if cached == 'grouped':
+    if cached == 'huggingface':
+        # Load directly from a HuggingFace dataset hub name (e.g. "DKYoon/SlimPajama-6B")
+        raw_datasets = load_dataset(dpt, streaming=True)
+        column_names = list(next(iter(raw_datasets["train"])).keys())
+        text_column_name = "text" if "text" in column_names else column_names[0]
+
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name])
+
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=column_names,
+        )
+
+        def group_texts(examples):
+            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            total_length = (total_length // training_args.context_len) * training_args.context_len
+            result = {
+                k: [t[i : i + training_args.context_len] for i in range(0, total_length, training_args.context_len)]
+                for k, t in concatenated_examples.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+        return lm_datasets
+
+    elif cached == 'grouped':
         print("Loading datasets: Grouped")
         lm_datasets = load_dataset(
             "arrow",
@@ -327,7 +357,7 @@ def train():
     # if training_args.local_rank > 0: 
     #     torch.distributed.barrier()
 
-    lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args, cached='grouped')
+    lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args, cached=data_args.dataset_cached)
 
     print(f"*** Datasets Loaded ***")
 
@@ -372,7 +402,7 @@ def train():
 
 
 
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = Trainer(model=model, processing_class=tokenizer, args=training_args, **data_module)
     model.config.use_cache = False
 
     if training_args.do_train:
