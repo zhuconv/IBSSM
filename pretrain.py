@@ -184,15 +184,6 @@ def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized
         subset = data_args.dataset_subset
         raw_datasets = load_dataset(dpt, subset, streaming=True) if subset else load_dataset(dpt, streaming=True)
 
-        # If only "train" split exists, split it into train/validation
-        available_splits = list(raw_datasets.keys()) if hasattr(raw_datasets, 'keys') else ["train"]
-        if "validation" not in available_splits:
-            train_stream = raw_datasets["train"]
-            # Use skip/take to create a validation split from the first 1000 examples
-            val_stream = train_stream.take(1000)
-            train_stream = train_stream.skip(1000)
-            raw_datasets = {"train": train_stream, "validation": val_stream}
-
         column_names = list(next(iter(raw_datasets["train"])).keys())
         text_column_name = "text" if "text" in column_names else column_names[0]
 
@@ -211,8 +202,11 @@ def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized
             return result
 
         lm_datasets = {}
-        for split_name, split_data in (raw_datasets.items() if hasattr(raw_datasets, 'items') else raw_datasets.items()):
-            tokenized = split_data.map(tokenize_function, batched=True, remove_columns=column_names)
+        available_splits = list(raw_datasets.keys()) if hasattr(raw_datasets, 'keys') else ["train"]
+        if "validation" not in available_splits:
+            logging.warning(f"No validation split found in {dpt}. Eval/predict will be disabled.")
+        for split_name in available_splits:
+            tokenized = raw_datasets[split_name].map(tokenize_function, batched=True, remove_columns=column_names)
             grouped = tokenized.map(group_texts, batched=True)
             lm_datasets[split_name] = grouped
 
@@ -373,11 +367,16 @@ def train():
     print(f"*** Datasets Loaded ***")
 
     train_dataset = lm_datasets["train"]
-    valid_dataset = lm_datasets["validation"]
+    valid_dataset = lm_datasets.get("validation", None)
+
+    if valid_dataset is None:
+        print("WARNING: No validation split available. Setting do_eval=False and do_predict=False.")
+        training_args.do_eval = False
+        training_args.do_predict = False
 
     # if training_args.local_rank == 0:
     #     torch.distributed.barrier()
-    
+
     data_collator = default_data_collator # DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
     data_module = dict(
