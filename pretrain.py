@@ -30,7 +30,10 @@ from transformers import Trainer, default_data_collator, AutoTokenizer, AutoConf
 from datasets import load_dataset, load_from_disk, IterableDataset
 
 from fla.models import *
-# from fla.models import GLAConfig, RWKV6Config, RetNetConfig, MambaConfig, Mamba2Config, GatedDeltaNetConfig
+from fla.models.ibm2 import *
+from fla.models.hybrid_gated_deltanet import *
+from fla.models.hybrid_mamba2 import *
+from fla.models.hybrid_ibm2 import *
 
 FLA_MODEL_NAME_MAPPING = {
     'rwkv6': 'RWKV6',
@@ -39,12 +42,18 @@ FLA_MODEL_NAME_MAPPING = {
     'mamba': 'Mamba',
     'gated_deltanet': 'GatedDeltaNet',
     'mamba2': 'Mamba2',
+    'samba': 'Samba',
 }
 
+HYBRID_MODEL_NAME_MAPPING = {
+    'hybrid_gated_deltanet': 'HybridGatedDeltaNet',
+    'hybrid_mamba2': 'HybridMamba2',
+}
 
 IB_MODEL_NAME_MAPPING = {
     'ib2': 'IBM2',
     'bibs2': 'BIBS2',
+    'hybrid_ibm2': 'HybridIBM2',
 }
 
 CPU_COUNT = os.cpu_count()
@@ -318,17 +327,21 @@ def train():
     #! Config and Model
     count_func = lambda model: sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
     if model_args.config_name:
-        if model_args.config_name in ['ibm2b', 'ibm2g']:
-            model_args.config_name = 'ibm2'
-            ib_type = 'bernoulli' if '2b' in model_args.config_name else 'gamma'
-        else:
-            ib_type = None
-        config = AutoConfig.for_model(model_args.config_name, hidden_size=1024)
-        if model_args.config_name in ['mamba2', 'ibm2']:
+        actual_name = model_args.config_name
+        ib_type = None
+        if actual_name in ['ibm2b', 'ibm2g']:
+            ib_type = 'bernoulli' if actual_name == 'ibm2b' else 'gamma'
+            actual_name = 'ibm2'
+        elif actual_name in ['hybrid_ibm2b', 'hybrid_ibm2g']:
+            ib_type = 'bernoulli' if actual_name == 'hybrid_ibm2b' else 'gamma'
+            actual_name = 'hybrid_ibm2'
+
+        config = AutoConfig.for_model(actual_name, hidden_size=1024)
+        if actual_name in ['mamba2', 'ibm2', 'hybrid_mamba2', 'hybrid_ibm2']:
             config.num_heads = 32
-            if ib_type is not None:
-                config.ib_type = ib_type
-                config.auxiliary_loss_weight = 1e-6 if ib_type == 'gamma' else 1e-1
+        if ib_type is not None:
+            config.ib_type = ib_type
+            config.auxiliary_loss_weight = 1e-6 if ib_type == 'gamma' else 1e-1
         model = AutoModelForCausalLM.from_config(config)
         # if training_args.local_rank == 0:
         print(f"Training new model from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")

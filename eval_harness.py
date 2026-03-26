@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from fla.models import *  # noqa
+from fla.models.ibm2 import *  # noqa
+from fla.models.hybrid_gated_deltanet import *  # noqa
+from fla.models.hybrid_mamba2 import *  # noqa
+from fla.models.hybrid_ibm2 import *  # noqa
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
