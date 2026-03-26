@@ -336,12 +336,33 @@ def train():
             ib_type = 'bernoulli' if actual_name == 'hybrid_ibm2b' else 'gamma'
             actual_name = 'hybrid_ibm2'
 
-        config = AutoConfig.for_model(actual_name, hidden_size=1024)
+        # Target ~380-400M params with hidden_size=1024
+        TARGET_LAYERS = {
+            'gated_deltanet': 15,        # 385M
+            'mamba2': 48,                 # 382M
+            'ibm2': 48,                   # 382M
+            'samba': 23,                  # 391M
+            'hybrid_gated_deltanet': 19,  # 394M
+            'hybrid_mamba2': 23,          # 390M
+            'hybrid_ibm2': 23,            # 390M
+        }
+        num_layers = TARGET_LAYERS.get(actual_name, None)
+        config = AutoConfig.for_model(actual_name, hidden_size=1024,
+                                      **(dict(num_hidden_layers=num_layers) if num_layers else {}))
         if actual_name in ['mamba2', 'ibm2', 'hybrid_mamba2', 'hybrid_ibm2']:
             config.num_heads = 32
         if ib_type is not None:
             config.ib_type = ib_type
             config.auxiliary_loss_weight = 1e-6 if ib_type == 'gamma' else 1e-1
+        # Set attn layers for hybrids based on actual num_hidden_layers
+        if hasattr(config, 'attn') and config.attn is not None:
+            config.attn['layers'] = tuple(i for i in range(config.num_hidden_layers) if i % 2 == 1)
+            config.attn['num_heads'] = config.attn.get('num_heads', 16)
+            config.attn['num_kv_heads'] = config.attn.get('num_kv_heads', config.attn['num_heads'])
+            # Ensure attn num_heads divides hidden_size
+            if config.hidden_size % config.attn['num_heads'] != 0:
+                config.attn['num_heads'] = 16
+                config.attn['num_kv_heads'] = 16
         model = AutoModelForCausalLM.from_config(config)
         # if training_args.local_rank == 0:
         print(f"Training new model from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")
