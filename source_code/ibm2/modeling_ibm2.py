@@ -39,12 +39,18 @@ with warnings.catch_warnings():
     try:
         from mamba_ssm.ops.triton.selective_state_update import selective_state_update
         from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
+        from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan
+        from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state
+        from mamba_ssm.ops.triton.ssd_state_passing import state_passing
     except ImportError:
         (
             selective_state_update,
             mamba_chunk_scan_combined,
             mamba_split_conv1d_scan_combined,
-        ) = (None, None, None)
+            chunk_scan,
+            chunk_state,
+            state_passing,
+        ) = (None, None, None, None, None, None)
     try:
         from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
     except ImportError:
@@ -53,6 +59,11 @@ with warnings.catch_warnings():
         selective_state_update,
         causal_conv1d_fn,
         causal_conv1d_update
+    ))
+    is_chunk_scan_available = all((
+        chunk_scan,
+        chunk_state,
+        state_passing,
     ))
 
 
@@ -345,6 +356,7 @@ class BernoulliIB4dA(nn.Module):
         self.hidden_size = hidden_size
         # self.attributor = nn.Linear(hidden_size, 1, bias=True)
         self._auxiliary_loss = 0
+        self._log_decay = None
         self.max_seqlen = max_seqlen
         self._attn = None
 
@@ -375,6 +387,9 @@ class BernoulliIB4dA(nn.Module):
         loss = self._auxiliary_loss
         self._auxiliary_loss = 0.0
         return loss
+
+    def get_log_decay(self):
+        return self._log_decay
 
     def compute_loss(self, att, epsilon=1e-6):
         if self.thetas is None:
@@ -407,6 +422,7 @@ class BernoulliIB4dA(nn.Module):
         dt_plus = F.softplus(dt + dt_bias)
         dA = (dt_plus * A)
         p_bern = torch.exp(dA)
+        self._log_decay = None
         # if self.epoch_frac < self.epoch_threshold:
         #     return hidden_states
         if self.training:
@@ -417,7 +433,8 @@ class BernoulliIB4dA(nn.Module):
             random_noise = torch.empty_like(logit).uniform_(1e-10, 1 - 1e-10)
             random_noise = torch.log(random_noise) - torch.log(1.0 - random_noise)
             sampled_bern = ((logit + random_noise) / self.temp).sigmoid()
-            new_A =  torch.log(sampled_bern) / dt_plus
+            self._log_decay = torch.log(sampled_bern)
+            new_A = self._log_decay / dt_plus
             #! loss backward is hanled in another func outside
             return dt, new_A
         else:
@@ -511,6 +528,56 @@ class IBM2Mixer(nn.Module):
                 "https://github.com/Dao-AILab/causal-conv1d"
             )
 
+    def _apply_ib(self, dt, A):
+        log_decay = None
+        if self.ib:
+            dt, A = self.ib(dt, self.dt_bias, A=A)
+            if self.ib_type == 'bernoulli' and self.training and hasattr(self.ib, 'get_log_decay'):
+                log_decay = self.ib.get_log_decay()
+                if log_decay is None:
+                    raise RuntimeError("Bernoulli IB did not provide sampled log decay for training.")
+        return dt, A, log_decay
+
+    def _maybe_store_attn(self, dt, A, log_decay=None):
+        if not self.return_attn:
+            return
+        if log_decay is not None:
+            attn = log_decay.mean(dim=-1)
+        else:
+            dt_plus = F.softplus(dt + self.dt_bias)
+            dA = (dt_plus * A)
+            attn = dA.mean(dim=-1)
+        self._attn = attn
+
+    def _manual_chunk_scan(self, hidden_states, B, C, dt, log_decay):
+        if not is_chunk_scan_available:
+            raise ImportError("chunk_state/state_passing/chunk_scan are required for Bernoulli IB training.")
+
+        batch_size, seq_len, _ = hidden_states.shape
+        x = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim)
+        B = B.reshape(batch_size, seq_len, self.n_groups, -1)
+        C = C.reshape(batch_size, seq_len, self.n_groups, -1)
+
+        dt = nn.functional.softplus(dt + self.dt_bias)
+        dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
+
+        pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+        if pad_size > 0:
+            dt = pad_tensor_by_size(dt, pad_size)
+            log_decay = pad_tensor_by_size(log_decay, pad_size)
+
+        dt = dt.reshape(batch_size, -1, self.chunk_size, self.num_heads).permute(0, 3, 1, 2).contiguous().float()
+        log_decay = log_decay.reshape(batch_size, -1, self.chunk_size, self.num_heads).permute(0, 3, 1, 2).contiguous().float()
+        dA_cumsum = torch.cumsum(log_decay, dim=-1)
+
+        states = chunk_state(B, x, dt, dA_cumsum, states_in_fp32=True)
+        nchunks = states.shape[1]
+        states = states.reshape(batch_size, nchunks, self.num_heads, -1)
+        states, final_states = state_passing(states, dA_cumsum[:, :, :, -1], initial_states=None)
+        states = states.reshape(batch_size, nchunks, self.num_heads, self.head_dim, self.ssm_state_size)
+        final_states = final_states.reshape(batch_size, self.num_heads, self.head_dim, self.ssm_state_size)
+        return chunk_scan(B, C, x, dt, dA_cumsum, states, D=self.D, z=None), final_states
+
     def cuda_kernels_forward(
         self,
         hidden_states: torch.Tensor,
@@ -543,14 +610,10 @@ class IBM2Mixer(nn.Module):
             #! HACK IBS forward function part
 
             if self.ib:
-                dt, A = self.ib(dt, self.dt_bias, A=A)
-                #! For IBM interpretration
-                if self.return_attn:
-                    dt_plus = F.softplus(dt + self.dt_bias)
-                    dA = (dt_plus * A)
-                    # dA = torch.exp(dA)
-                    attn = dA.mean(dim=-1) # - 0.1 * dA.std(dim=-1) # attn shape [batch_size, seqlen]
-                    self._attn = attn
+                dt, A, log_decay = self._apply_ib(dt, A)
+                if log_decay is not None:
+                    raise NotImplementedError("Bernoulli IB does not support cached training updates.")
+                self._maybe_store_attn(dt, A)
 
             # 2. Convolution sequence transformation
             hidden_states_B_C = causal_conv1d_update(
@@ -606,23 +669,19 @@ class IBM2Mixer(nn.Module):
 
             #! HACK IBS forward function part
 
+            log_decay = None
             if self.ib:
                 # self.intermediate_size: self.d_ssm
                 # self.ssm_state_size: d_state
                 _, _, gate, hidden_states_B_C, dt = projected_states.split(
                     [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
                 )
-             
-                dt = self.ib(dt, self.dt_bias, A=A)
-                if self.return_attn:
-                    dt_plus = F.softplus(dt + self.dt_bias)
-                    dA = (dt_plus * A)
-                    # dA = torch.exp(dA)
-                    attn = dA.mean(dim=-1) # - 0.1 * dA.std(dim=-1) # attn shape [batch_size, seqlen]
-                    self._attn = attn
+
+                dt, A, log_decay = self._apply_ib(dt, A)
+                self._maybe_store_attn(dt, A, log_decay=log_decay)
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
-            if self.training and cache_params is None:
+            if self.training and cache_params is None and not self.ib:
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -645,9 +704,10 @@ class IBM2Mixer(nn.Module):
                 )
 
             else:
-                _, _, gate, hidden_states_B_C, dt = projected_states.split(
-                    [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
-                )
+                if not self.ib:
+                    _, _, gate, hidden_states_B_C, dt = projected_states.split(
+                        [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+                    )
 
                 # 2. Convolution sequence transformation
                 # Init cache
@@ -681,21 +741,24 @@ class IBM2Mixer(nn.Module):
                 )
 
                 # 3. SSM transformation
-                scan_output, ssm_state = mamba_chunk_scan_combined(
-                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
-                    dt,
-                    A,
-                    B.view(batch_size, seq_len, self.n_groups, -1),
-                    C.view(batch_size, seq_len, self.n_groups, -1),
-                    chunk_size=self.chunk_size,
-                    D=self.D,
-                    z=None,
-                    seq_idx=None,
-                    return_final_states=True,
-                    dt_bias=self.dt_bias,
-                    dt_softplus=True,
-                    **dt_limit_kwargs,
-                )
+                if log_decay is not None:
+                    scan_output, ssm_state = self._manual_chunk_scan(hidden_states, B, C, dt, log_decay)
+                else:
+                    scan_output, ssm_state = mamba_chunk_scan_combined(
+                        hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                        dt,
+                        A,
+                        B.view(batch_size, seq_len, self.n_groups, -1),
+                        C.view(batch_size, seq_len, self.n_groups, -1),
+                        chunk_size=self.chunk_size,
+                        D=self.D,
+                        z=None,
+                        seq_idx=None,
+                        return_final_states=True,
+                        dt_bias=self.dt_bias,
+                        dt_softplus=True,
+                        **dt_limit_kwargs,
+                    )
 
                 # Init cache
                 if ssm_state is not None and cache_params is not None:
